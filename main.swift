@@ -765,9 +765,15 @@ final class IndicatorView: NSView {
     private static var spriteCache: [String: NSImage] = [:]
     static var codexSprite: NSImage? {
         if let img = spriteCache[currentPetID] { return img }
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/GitHub/agent-notch/pets/pet-\(currentPetID).webp").path
-        guard let img = NSImage(contentsOfFile: path) else { return nil }
+        // pets/ lives next to the binary (repo checkout); fall back to cwd
+        let exeDir = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
+            .resolvingSymlinksInPath().deletingLastPathComponent()
+        let candidates = [
+            exeDir.appendingPathComponent("pets/pet-\(currentPetID).webp").path,
+            FileManager.default.currentDirectoryPath + "/pets/pet-\(currentPetID).webp",
+        ]
+        guard let path = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }),
+              let img = NSImage(contentsOfFile: path) else { return nil }
         spriteCache[currentPetID] = img
         return img
     }
