@@ -5,6 +5,12 @@ import ApplicationServices
 
 enum AgentKind: String { case claude = "Claude Code", codex = "Codex" }
 
+/// Claude Code encodes a project cwd as a directory name by replacing every
+/// non-alphanumeric character (not just "/") with "-".
+func encodeProjectDir(_ cwd: String) -> String {
+    String(cwd.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+}
+
 struct AgentSession {
     let id: String
     let kind: AgentKind
@@ -143,7 +149,7 @@ final class ProcessDiscovery {
         // a claude process can hold several project transcripts open; prefer
         // the one whose encoded project dir matches the process cwd
         if all.count > 1, let cwd {
-            let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+            let encoded = encodeProjectDir(cwd)
             if let preferred = all.first(where: { $0.contains(encoded) }) { return preferred }
         }
         return all.first
@@ -1100,7 +1106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let path = snap.transcriptPath {
                     seen.insert(path)
                 } else if snap.kind == .claude, let cwd = snap.cwd {
-                    let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+                    let encoded = encodeProjectDir(cwd)
                     let i = cwdIndex[encoded, default: 0]
                     cwdIndex[encoded] = i + 1
                     seen.insert("cwd#\(encoded)#\(i)")
@@ -1173,7 +1179,7 @@ if CommandLine.arguments.contains("--scan") {
     var cwdCounts: [String: Int] = [:]
     for s in snaps {
         if let p = s.transcriptPath { live.insert(p) }
-        else if s.kind == .claude, let c = s.cwd { cwdCounts[c.replacingOccurrences(of: "/", with: "-"), default: 0] += 1 }
+        else if s.kind == .claude, let c = s.cwd { cwdCounts[encodeProjectDir(c), default: 0] += 1 }
     }
     print("== sessions ==")
     for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts) {
