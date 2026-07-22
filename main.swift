@@ -793,10 +793,13 @@ final class IndicatorView: NSView {
         // pets/ lives next to the binary (repo checkout); fall back to cwd
         let exeDir = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
             .resolvingSymlinksInPath().deletingLastPathComponent()
-        let candidates = [
+        var candidates = [
             exeDir.appendingPathComponent("pets/pet-\(currentPetID).webp").path,
             FileManager.default.currentDirectoryPath + "/pets/pet-\(currentPetID).webp",
         ]
+        if let res = Bundle.main.resourcePath {  // app-bundle install
+            candidates.insert("\(res)/pets/pet-\(currentPetID).webp", at: 0)
+        }
         guard let path = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }),
               let img = NSImage(contentsOfFile: path) else { return nil }
         spriteCache[currentPetID] = img
