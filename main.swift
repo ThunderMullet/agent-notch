@@ -22,6 +22,7 @@ struct AgentSession {
     var threadID: String = ""
     var parentID: String?
     var nickname: String?
+    var tty: String?  // terminal device of the owning process (focus routing)
     var children: [AgentSession] = []
     var isLive: Bool = false  // process alive (from discovery, never mtime)
     // last user/assistant entry — housekeeping writes (away_summary etc.)
@@ -46,7 +47,7 @@ final class ProcessDiscovery {
     // open jsonl for it — open-vibe-island falls back to the process cwd (and
     // claims by tty so a terminal maps to one session). Codex holds its
     // rollout file open, so the path route always works there.
-    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String? }
+    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String?; let tty: String? }
 
     // open-vibe-island uses 0.5s/0.2s here, but Process-spawn overhead under
     // heavy load (a codex swarm compiling) blows through 0.2s and every agent
@@ -82,11 +83,11 @@ final class ProcessDiscovery {
                 guard path != nil || cwd != nil else { continue }
                 // claim key: sessionID ?? tty ?? cwd — one session per terminal
                 guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, tty: tty))
             case .codex:
                 guard let path = bestCodexTranscript(in: lsof),
                       claimed.insert("codex:\(path)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd, tty: tty))
             }
         }
         return out
@@ -163,7 +164,7 @@ final class ProcessDiscovery {
         }
     }
 
-    private func run(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
+    func run(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
@@ -194,10 +195,12 @@ final class SessionScanner {
     /// `claudeCwdCounts` = encoded-project-dir → number of claude processes
     /// with that cwd (the fallback when claude exposes no open transcript).
     /// Together they are the sole source of truth for isRunning.
-    func scan(live: Set<String>, claudeCwdCounts: [String: Int]) -> [AgentSession] {
+    /// `ttys` maps a liveness key (transcript path or "cwd#<encoded>#<i>") to
+    /// the owning process's terminal device, for click-to-focus routing.
+    func scan(live: Set<String>, claudeCwdCounts: [String: Int], ttys: [String: String] = [:]) -> [AgentSession] {
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
-        var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
-            + groupCodex(scanCodex(live: live).filter(recent))
+        var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts, ttys: ttys).filter(recent)
+            + groupCodex(scanCodex(live: live, ttys: ttys).filter(recent))
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -233,7 +236,7 @@ final class SessionScanner {
         return out
     }
 
-    private func scanClaude(live: Set<String>, cwdCounts: [String: Int]) -> [AgentSession] {
+    private func scanClaude(live: Set<String>, cwdCounts: [String: Int], ttys: [String: String]) -> [AgentSession] {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".claude/projects")
         guard let projects = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return out }
@@ -256,14 +259,15 @@ final class SessionScanner {
                 sess.prompt = info.prompt
                 sess.lastActivity = info.activity
                 sess.isLive = live.contains(f.path) || idx < liveByCwd
-                sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive)
+                sess.tty = ttys[f.path] ?? (idx < liveByCwd ? ttys["cwd#\(proj.lastPathComponent)#\(idx)"] : nil)
+                sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive, parentTty: sess.tty)
                 out.append(sess)
             }
         }
         return out
     }
 
-    private func scanCodex(live: Set<String>) -> [AgentSession] {
+    private func scanCodex(live: Set<String>, ttys: [String: String]) -> [AgentSession] {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".codex/sessions")
         guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return out }
@@ -277,6 +281,7 @@ final class SessionScanner {
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
             sess.isLive = live.contains(f.path)
+            sess.tty = ttys[f.path]
             sess.threadID = meta.id
             sess.parentID = meta.parentID
             sess.nickname = meta.nickname
@@ -286,7 +291,7 @@ final class SessionScanner {
     }
 
     /// Claude Code subagent transcripts live in <proj>/<session-uuid>/subagents/agent-*.jsonl
-    private func claudeSubagents(sessionFile f: URL, parentLive: Bool) -> [AgentSession] {
+    private func claudeSubagents(sessionFile f: URL, parentLive: Bool, parentTty: String?) -> [AgentSession] {
         let dir = f.deletingPathExtension().appendingPathComponent("subagents")
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
         var kids: [AgentSession] = []
@@ -301,6 +306,7 @@ final class SessionScanner {
             // subagents share the parent process (open-vibe-island tracks them
             // as parent metadata) — liveness inherits, busyness from writes
             kid.isLive = parentLive
+            kid.tty = parentTty
             kid.lastActivity = info.activity
             kids.append(kid)
         }
@@ -495,9 +501,21 @@ final class DitherSeparator: NSView {
 
 // MARK: - Session list popover
 
+/// Row wrapper that catches clicks anywhere in the row (labels included) and
+/// routes them to the session, instead of letting them bubble up and close
+/// the panel.
+final class ClickableRow: NSView {
+    var onClick: (() -> Void)?
+    override func hitTest(_ point: NSPoint) -> NSView? { frame.contains(point) ? self : nil }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseUp(with event: NSEvent) { onClick?() }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
 final class SessionListController: NSViewController {
     var sessions: [AgentSession] = [] { didSet { rebuild() } }
     var onLayoutChange: (() -> Void)?
+    var onActivate: ((AgentSession) -> Void)?
     private let stack = NSStackView()
     private var icons: [DitherIconView] = []
     private var animTimer: Timer?
@@ -534,7 +552,7 @@ final class SessionListController: NSViewController {
                 stack.addArrangedSubview(sep)
                 sep.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -24).isActive = true
             }
-            stack.addArrangedSubview(row(for: s))
+            stack.addArrangedSubview(clickable(row(for: s), session: s))
             if !s.children.isEmpty {
                 let open = expandedIDs.contains(s.id)
                 let btn = NSButton(title: "\(open ? "▾" : "▸") \(s.children.count) subagent\(s.children.count == 1 ? "" : "s")",
@@ -548,7 +566,7 @@ final class SessionListController: NSViewController {
                 stack.addArrangedSubview(wrap)
                 if open {
                     for child in s.children.prefix(8) {
-                        stack.addArrangedSubview(childRow(for: child))
+                        stack.addArrangedSubview(clickable(childRow(for: child), session: child))
                     }
                 }
             }
@@ -559,6 +577,21 @@ final class SessionListController: NSViewController {
                 for icon in self.icons { icon.t += 0.12 }
             }
         }
+    }
+
+    private func clickable(_ content: NSView, session: AgentSession) -> NSView {
+        let wrap = ClickableRow()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        content.translatesAutoresizingMaskIntoConstraints = false
+        wrap.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: wrap.topAnchor),
+            content.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
+            content.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+        ])
+        wrap.onClick = { [weak self] in self?.onActivate?(session) }
+        return wrap
     }
 
     @objc private func toggleChildren(_ sender: NSButton) {
@@ -914,6 +947,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // open-vibe-island removal rule: a transcript's process must be missing
     // for 2 consecutive polls (~6 s) before its session stops being live
     private var missCounts: [String: Int] = [:]
+    // liveness key → terminal device, refreshed each poll, dropped with the key
+    private var ttyByKey: [String: String] = [:]
     private let listController = SessionListController()
     private var frame = 0
     private var claudeWasLive = false
@@ -995,6 +1030,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         listController.onLayoutChange = { [weak self] in
             guard let self, self.expanded else { return }
             self.window.setFrame(self.expandedFrame(), display: true)
+        }
+        listController.onActivate = { [weak self] session in
+            guard let self else { return }
+            self.setExpanded(false)
+            self.activate(session)
         }
         notchView.onCollapse = { [weak self] in
             guard let self, self.expanded else { return }
@@ -1127,6 +1167,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CATransaction.commit()
     }
 
+    /// Route a clicked session to where it lives: Codex threads open in the
+    /// Codex app (codex://threads/<id>); terminal-attached sessions focus the
+    /// terminal app that owns their tty.
+    private func activate(_ session: AgentSession) {
+        if let tty = session.tty {
+            focusTerminal(tty: tty)
+            return
+        }
+        if session.kind == .codex, !session.threadID.isEmpty, !session.threadID.contains("/"),
+           let url = URL(string: "codex://threads/\(session.threadID)") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Walk up the process tree from whatever runs on `tty` until we hit a
+    /// real GUI app (the terminal emulator), and bring it to the front.
+    private func focusTerminal(tty: String) {
+        scanQueue.async { [weak self] in
+            guard let self,
+                  let out = self.discovery.run("/bin/ps", ["-Ao", "pid=,ppid=,tty="], timeout: 2.0) else { return }
+            var ppidOf: [Int: Int] = [:]
+            var onTty: [Int] = []
+            for line in out.split(whereSeparator: \.isNewline) {
+                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                guard parts.count == 3, let pid = Int(parts[0]), let ppid = Int(parts[1]) else { continue }
+                ppidOf[pid] = ppid
+                if parts[2] == Substring(tty) { onTty.append(pid) }
+            }
+            for start in onTty {
+                var pid = start, hops = 0
+                while pid > 1, hops < 20 {
+                    if let app = NSRunningApplication(processIdentifier: pid_t(pid)),
+                       app.activationPolicy == .regular {
+                        DispatchQueue.main.async {
+                            if #available(macOS 14.0, *) { app.activate() }
+                            else { app.activate(options: [.activateIgnoringOtherApps]) }
+                        }
+                        return
+                    }
+                    guard let pp = ppidOf[pid] else { break }
+                    pid = pp; hops += 1
+                }
+            }
+        }
+    }
+
     private func rescan() {
         scanQueue.async { [weak self] in
             guard let self else { return }
@@ -1135,18 +1221,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var seen = Set<String>()
             var cwdIndex: [String: Int] = [:]
             for snap in self.discovery.liveTranscripts() {
+                var key: String?
                 if let path = snap.transcriptPath {
-                    seen.insert(path)
+                    key = path
                 } else if snap.kind == .claude, let cwd = snap.cwd {
                     let encoded = encodeProjectDir(cwd)
                     let i = cwdIndex[encoded, default: 0]
                     cwdIndex[encoded] = i + 1
-                    seen.insert("cwd#\(encoded)#\(i)")
+                    key = "cwd#\(encoded)#\(i)"
+                }
+                if let key {
+                    seen.insert(key)
+                    if let tty = snap.tty { self.ttyByKey[key] = tty }
                 }
             }
             for p in seen { self.missCounts[p] = 0 }
             for (p, n) in self.missCounts where !seen.contains(p) {
-                if n + 1 >= 2 { self.missCounts.removeValue(forKey: p) } else { self.missCounts[p] = n + 1 }
+                if n + 1 >= 2 {
+                    self.missCounts.removeValue(forKey: p)
+                    self.ttyByKey.removeValue(forKey: p)
+                } else { self.missCounts[p] = n + 1 }
             }
             var live = Set<String>()
             var cwdCounts: [String: Int] = [:]
@@ -1158,7 +1252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     live.insert(key)
                 }
             }
-            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts)
+            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts, ttys: self.ttyByKey)
             DispatchQueue.main.async {
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
