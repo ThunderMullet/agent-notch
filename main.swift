@@ -716,6 +716,16 @@ final class IndicatorView: NSView {
             let pill = NSBezierPath(roundedRect: r, xRadius: 11, yRadius: 11)
             NSColor.black.withAlphaComponent(0.65).setFill()
             pill.fill()
+        } else {
+            // idle heartbeat: dim dot in a mini pill, so the app's presence
+            // (and the click target for the panel) is always visible
+            let r = NSRect(x: bounds.maxX - 24, y: cy - 7, width: 18, height: 14)
+            let pill = NSBezierPath(roundedRect: r, xRadius: 7, yRadius: 7)
+            NSColor.black.withAlphaComponent(0.55).setFill()
+            pill.fill()
+            ctx.setFillColor(NSColor.white.withAlphaComponent(0.45).cgColor)
+            ctx.fillEllipse(in: NSRect(x: r.midX - 2.5, y: cy - 2.5, width: 5, height: 5))
+            return
         }
         var x = bounds.maxX - 6  // right-aligned toward the notch
         // each agent keeps its own slot: mascot while running, green blob when
