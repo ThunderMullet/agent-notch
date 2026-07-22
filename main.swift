@@ -698,6 +698,25 @@ final class IndicatorView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let cy = bounds.midY
+        // dark pill behind the pixels — light menu-bar backgrounds (wallpaper,
+        // light mode) otherwise swallow the green blob and coral mascot
+        var pillW: CGFloat = 0
+        switch claudeState {
+        case .running: pillW += 28.8 + 6
+        case .done: pillW += 24
+        case .inactive: break
+        }
+        switch codexState {
+        case .running: pillW += 26 * 192 / 208 + 2
+        case .done: pillW += 19
+        case .inactive: break
+        }
+        if pillW > 0 {
+            let r = NSRect(x: bounds.maxX - pillW - 11, y: cy - 11, width: pillW + 10, height: 22)
+            let pill = NSBezierPath(roundedRect: r, xRadius: 11, yRadius: 11)
+            NSColor.black.withAlphaComponent(0.65).setFill()
+            pill.fill()
+        }
         var x = bounds.maxX - 6  // right-aligned toward the notch
         // each agent keeps its own slot: mascot while running, green blob when
         // freshly done (cleared once you revisit the terminal)
